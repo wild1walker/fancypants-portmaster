@@ -64,6 +64,20 @@ fi
 
 mkdir -p "$GAMEDIR/saves"
 
+# CPU: the performance governor while the game runs, then the previous one again. The
+# frequency ramping of the default governors shows as hitches, and the hub is CPU bound
+# (FPA_CPU_BOOST="0" in fancypants.cfg leaves the governor alone).
+governors=()
+if [ "${FPA_CPU_BOOST:-1}" = "1" ]; then
+  for g in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    [ -f "$g" ] || continue
+    grep -qw performance "${g%/*}/scaling_available_governors" 2>/dev/null || continue
+    old=$(cat "$g")
+    [ "$old" = "performance" ] && continue
+    echo performance | $ESUDO tee "$g" >/dev/null 2>&1 && governors+=("$g=$old")
+  done
+fi
+
 # gptokeyb is unresponsive on muOS, so gptokeyb2 is used there
 if [ "$CFW_NAME" = "muOS" ] && [ -n "$GPTOKEYB2" ]; then
   $GPTOKEYB2 "ruffle_sdl" -c "$GAMEDIR/fancypants.gptk" &
@@ -72,11 +86,26 @@ else
 fi
 pm_platform_helper "$GAMEDIR/ruffle_sdl"
 
+# No mouse on a handheld: Ruffle looks for the clip under the mouse only when it moves, instead
+# of searching every clip of a level on every frame (a third of World 3's frame time)
+export RUFFLE_LAZY_MOUSE_PICK=1
+# ruffle_sdl turns on frame skipping when World 3 loads (it advances one fixed step per frame,
+# so slow frames would slow the game down) and, when the hub loads, makes Start a pause key
+# (the hub has no pause of its own; Worlds 1 to 3 pause on Start themselves)
+ruffle_opts=(--frameskip-with FPAWorld3.swf)
+if [ "${FPA_HUB_PAUSE:-1}" = "1" ]; then
+  ruffle_opts+=(--pause-key Space --pause-with FPAWorld4.swf)
+fi
+
 # ruffle_sdl: Ruffle on the firmware's own SDL2 and GLES 3 (no Weston or X11 needed)
 # run-ruffle restarts Ruffle when the game switches worlds, so only one world is in memory
 "$GAMEDIR/tools/run-ruffle" "$GAMEDIR/ruffle_sdl" --stage-scale movie --quality "$FPA_QUALITY" \
-  -Paspect="$FPA_ASPECT" -Pworldfps="$FPA_WORLD_FPS" --save-directory "$GAMEDIR/saves" \
-  "$DATADIR/ClassicPack-port.swf"
+  "${ruffle_opts[@]}" -Paspect="$FPA_ASPECT" -Pworldfps="$FPA_WORLD_FPS" \
+  --save-directory "$GAMEDIR/saves" "$DATADIR/ClassicPack-port.swf"
+
+for g in "${governors[@]}"; do
+  echo "${g#*=}" | $ESUDO tee "${g%%=*}" >/dev/null 2>&1
+done
 
 # Clean up after ourselves
 pm_finish

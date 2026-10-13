@@ -10,19 +10,19 @@ Buttons are named as the game's prompts show them. They work by position, as SDL
 |--|--|
 | D-pad / Left stick | Move, Up enters doors, Down ducks |
 | A / B / X / Y | Jump / Attack / Special / Special 2 |
-| Start | Pause |
+| Start | Pause (in the hub too) |
 | L1 / L2 | Music / sound effects volume: 100%, 50%, off (saved) |
 | Select + Start | Quit |
 
 ## Notes
 
-* On 1 GB devices turn on zram (or swap) in your firmware's settings, so the game does not run out of memory.
-* World 4 (the hub) runs at about 16 fps on an RG35XX H, but at the right game speed.
+* On 1 GB devices the port frees level art it has not drawn for a while when memory runs low. Turning on zram (or swap) in your firmware's settings is still a good idea for long World 3 sessions.
+* World 4 (the hub) runs at about 16 fps on an RG35XX H, but at the right game speed. Start pauses it.
+* While the game runs, the CPU runs at full speed (the firmware's setting comes back when you quit). Set `FPA_CPU_BOOST="0"` in `fancypants.cfg` to leave it to the firmware.
 * World 3 is the heaviest world. On an RG35XX H it keeps close to full speed by drawing fewer frames when busy, so it can look choppier than Worlds 1 and 2.
 * Entering a world door shows a short black screen while Ruffle restarts to free memory.
 * Steam achievements and cloud saves are not available, progress is saved locally.
-* Settings (quality, screen fit, frame rate) are in `ports/fancypants/fancypants.cfg`.
-* The hub has no pause; Start pauses inside Worlds 1 to 3.
+* Settings (quality, screen fit, frame rate, hub pause, CPU speed) are in `ports/fancypants/fancypants.cfg`.
 * On 4:3 and square screens the worlds show more of the level above, and the floor stays at the bottom of the screen.
 
 ## Reporting problems

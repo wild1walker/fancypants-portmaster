@@ -2,6 +2,8 @@
 """Adds test only hooks to a ruffle_sdl source tree (for PC builds, never for the release binary):
   RUFFLE_SDL_SHOT=<f.ppm>   touching <f.ppm>.req saves the next frame to <f.ppm>
                             writing an SDL key name (e.g. "space") to <f.ppm>.key taps that key
+                            (straight to the movie; use xdotool for keys the front end handles,
+                            like --pause-key); the pause banner is saved to <f.ppm>.pause.ppm
 Usage: sdl_test_hooks.py <ruffle source dir>   (undo with: git -C <dir> checkout -- sdl/src/main.rs)
 The capture reads the window with glReadPixels on the GL context wgpu shares. wgpu leaves its
 pixel pack state set after a texture readback (BitmapData.colorTransform and similar): a bound
@@ -14,7 +16,7 @@ s=s.replace("""    let target = SdlTarget {
         gl,""","""    let shot_gl = gl.clone();
     let target = SdlTarget {
         gl,""",1)
-old="""                window.gl_swap_window();"""
+old="""                pacer.before_swap(frame_rate);"""
 new="""                if let Some(shot) = std::env::var_os("RUFFLE_SDL_SHOT") {
                     let req = std::path::PathBuf::from(format!("{}.req", shot.to_string_lossy()));
                     if req.exists() {
@@ -60,9 +62,34 @@ new="""                if let Some(shot) = std::env::var_os("RUFFLE_SDL_SHOT") {
                         let _ = std::fs::remove_file(&req);
                     }
                 }
-                window.gl_swap_window();"""
+                pacer.before_swap(frame_rate);"""
 assert s.count(old)==1; s=s.replace(old,new)
-old2='''        let mut wait = next_frame.saturating_duration_since(Instant::now());'''
+# the pause banner, as drawn (no wgpu readback state to work around here)
+old="""                    port::draw_pause_banner(&banner_gl, sw, sh);
+"""
+new="""                    port::draw_pause_banner(&banner_gl, sw, sh);
+                    if let Some(shot) = std::env::var_os("RUFFLE_SDL_SHOT") {
+                        let mut px = vec![0u8; (sw * sh * 4) as usize];
+                        unsafe {
+                            banner_gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                            banner_gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                            banner_gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+                            banner_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                            banner_gl.read_pixels(0, 0, sw as i32, sh as i32, glow::RGBA,
+                                glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut px)));
+                        }
+                        let mut out = format!("P6 {sw} {sh} 255\\n").into_bytes();
+                        for y in (0..sh).rev() {
+                            for x in 0..sw {
+                                let i = ((y * sw + x) * 4) as usize;
+                                out.extend_from_slice(&px[i..i + 3]);
+                            }
+                        }
+                        let _ = std::fs::write(format!("{}.pause.ppm", shot.to_string_lossy()), out);
+                    }
+"""
+assert s.count(old)==1; s=s.replace(old,new)
+old2='''        let mut wait = if paused.is_some() {'''
 new2='''        if let Some(shot) = std::env::var_os("RUFFLE_SDL_SHOT") {
             let kf = format!("{}.key", shot.to_string_lossy());
             if let Ok(name) = std::fs::read_to_string(&kf) {

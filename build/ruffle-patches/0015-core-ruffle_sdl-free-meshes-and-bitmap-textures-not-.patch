@@ -1,0 +1,336 @@
+From ae322b693a2f74295fdb754a5d4a4d0fd0c2bb5a Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Tue, 13 Oct 2026 19:18:57 +0000
+Subject: [PATCH] core, ruffle_sdl: free meshes and bitmap textures not drawn
+ lately when memory runs low
+
+Ruffle keeps the tessellation of every shape it has drawn and the GPU
+texture of every library bitmap a shape filled with, for the life of the
+movie (a FIXME in BitmapCharacter::bitmap_handle). Worlds 2 and 3 of Fancy
+Pants Adventures draw each level's art into cache bitmaps when the level
+loads and never draw those shapes again, so every level visited added its
+meshes and fill textures for good: memory grew as the game went on, and
+1 GB handhelds needed zram for longer sessions.
+
+* A drawn shape notes the current render epoch. ruffle_sdl starts a new
+  epoch every 5 s (not while paused).
+* When the system has less than RUFFLE_EVICT_MB (default 350, 0 = never)
+  of memory available, Player::evict_unused_render_data(4) drops the
+  tessellations of lazily tessellated shapes not drawn in the last 4
+  epochs (15 to 20 s), then the textures of library bitmaps that no mesh
+  holds any more (the library's handle is the only reference left), and
+  ruffle_sdl trims the heap. Both are made again on their next draw, the
+  same way lazy shapes are made on their first. With more memory free
+  nothing is dropped, so devices with more RAM behave as before.
+* BitmapCharacter keeps its handle in a RefCell instead of a OnceCell so
+  it can be dropped.
+---
+ core/src/character.rs              | 30 ++++++++++++++-----
+ core/src/display_object.rs         |  1 +
+ core/src/display_object/graphic.rs | 37 +++++++++++++++++++++++-
+ core/src/library.rs                | 25 ++++++++++++++++
+ core/src/player.rs                 | 18 ++++++++++++
+ sdl/src/main.rs                    | 46 ++++++++++++++++++++++++++++++
+ 6 files changed, 149 insertions(+), 8 deletions(-)
+
+diff --git a/core/src/character.rs b/core/src/character.rs
+index 9901c15b3..19720f82f 100644
+--- a/core/src/character.rs
++++ b/core/src/character.rs
+@@ -1,4 +1,4 @@
+-use std::cell::OnceCell;
++use std::cell::RefCell;
+ 
+ use crate::backend::audio::SoundHandle;
+ use crate::binary_data::BinaryData;
+@@ -37,8 +37,9 @@ pub struct BitmapCharacter<'gc> {
+     #[collect(require_static)]
+     compressed: CompressedBitmap,
+     /// A lazily constructed GPU handle, used when performing fills with this bitmap
++    /// (PortMaster port: dropped again by `evict_unused_handle` once no mesh uses it)
+     #[collect(require_static)]
+-    handle: OnceCell<BitmapHandle>,
++    handle: RefCell<Option<BitmapHandle>>,
+     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
+     /// a `Bitmap` displayobject.
+     avm2_class: Lock<BitmapClass<'gc>>,
+@@ -61,7 +62,7 @@ impl<'gc> BitmapCharacter<'gc> {
+         );
+         Self {
+             compressed,
+-            handle: OnceCell::default(),
++            handle: RefCell::new(None),
+             avm2_class: Lock::new(BitmapClass::NoSubclass),
+         }
+     }
+@@ -82,16 +83,31 @@ impl<'gc> BitmapCharacter<'gc> {
+         &self,
+         backend: &mut dyn RenderBackend,
+     ) -> Result<BitmapHandle, RenderError> {
+-        // FIXME - use `OnceCell::get_or_try_init` when stabilized.
+-        if let Some(handle) = self.handle.get() {
++        if let Some(handle) = self.handle.borrow().as_ref() {
+             return Ok(handle.clone());
+         }
+         let decoded = self.compressed.decode()?;
+         let new_handle = backend.register_bitmap(decoded)?;
+-        // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
+-        self.handle.set(new_handle.clone()).unwrap();
++        *self.handle.borrow_mut() = Some(new_handle.clone());
+         Ok(new_handle)
+     }
++
++    /// PortMaster port: drops the GPU texture when nothing but the library holds it (no mesh
++    /// fills with it any more); the next fill decodes and uploads the bitmap again.
++    pub fn evict_unused_handle(&self) -> bool {
++        let Ok(mut handle) = self.handle.try_borrow_mut() else {
++            return false;
++        };
++        if handle
++            .as_ref()
++            .is_some_and(|h| std::sync::Arc::strong_count(&h.0) == 1)
++        {
++            *handle = None;
++            true
++        } else {
++            false
++        }
++    }
+ }
+ 
+ /// Holds a bitmap from an SWF tag, plus the decoded width/height.
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index 64e3a3258..0c249a0df 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -56,6 +56,7 @@ pub use bitmap::{Bitmap, BitmapClass};
+ pub use edit_text::LayoutDebugBoxesFlag;
+ pub use edit_text::{AutoSizeMode, EditText, TextSelection};
+ pub use graphic::Graphic;
++pub(crate) use graphic::advance_render_epoch;
+ pub use interactive::{Avm2MousePick, InteractiveObject, TInteractiveObject};
+ pub use loader_display::LoaderDisplay;
+ pub use morph_shape::MorphShape;
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index 3157cbd74..037d73727 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -18,8 +18,9 @@ use gc_arena::{Collect, Gc, Mutation};
+ use ruffle_common::utils::HasPrefixField;
+ use ruffle_render::backend::ShapeHandle;
+ use ruffle_render::commands::CommandHandler;
+-use std::cell::{OnceCell, RefCell, RefMut};
++use std::cell::{Cell, OnceCell, RefCell, RefMut};
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicU32, Ordering};
+ 
+ #[derive(Clone, Collect, Copy)]
+ #[collect(no_drop)]
+@@ -91,6 +92,7 @@ impl<'gc> Graphic<'gc> {
+             tag: if lazy_records { tag } else { None },
+             movie,
+             scaled_handle: RefCell::new(TessellationCache::new()),
++            last_drawn: Cell::new(0),
+         };
+ 
+         Graphic(Gc::new(
+@@ -128,6 +130,7 @@ impl<'gc> Graphic<'gc> {
+             }),
+             movie: context.root_swf.clone(),
+             scaled_handle: RefCell::new(TessellationCache::new()),
++            last_drawn: Cell::new(0),
+         };
+ 
+         Graphic(Gc::new(
+@@ -167,6 +170,24 @@ impl<'gc> Graphic<'gc> {
+         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
+     }
+ 
++    /// PortMaster port: drops the tessellations of a lazily tessellated shape that has not been
++    /// drawn since epoch `before`; the next draw tessellates it again. Returns how many meshes
++    /// were dropped.
++    pub(crate) fn evict_unused_meshes(self, before: u32) -> usize {
++        let shared = self.0.shared.get();
++        if shared.render_handle.is_some() || shared.last_drawn.get() >= before {
++            return 0;
++        }
++        let Ok(mut cache) = shared.scaled_handle.try_borrow_mut() else {
++            return 0;
++        };
++        let n = cache.len();
++        if n > 0 {
++            *cache = TessellationCache::new();
++        }
++        n
++    }
++
+     /// Returns the best shape handle for the current scale, retessellating if necessary.
+     fn get_or_retessellate_handle(
+         self,
+@@ -177,6 +198,7 @@ impl<'gc> Graphic<'gc> {
+         // Since graphics are created from a shared shape, we may be able to reuse a
+         // cached tessellation from another instance at a similar scale.
+         let shared = self.0.shared.get();
++        shared.last_drawn.set(RENDER_EPOCH.load(Ordering::Relaxed));
+ 
+         {
+             let mut cache = shared.scaled_handle.borrow_mut();
+@@ -402,6 +424,19 @@ struct GraphicShared {
+     movie: Arc<SwfMovie>,
+     #[collect(require_static)]
+     scaled_handle: RefCell<TessellationCache>,
++    /// PortMaster port: the eviction epoch in which the shape was last drawn
++    /// (`evict_unused_meshes`).
++    #[collect(require_static)]
++    last_drawn: Cell<u32>,
++}
++
++/// PortMaster port: a counter the front end advances every few seconds
++/// (`Player::advance_render_epoch`); a drawn shape notes its value.
++static RENDER_EPOCH: AtomicU32 = AtomicU32::new(1);
++
++/// PortMaster port: starts a new eviction epoch and returns it.
++pub(crate) fn advance_render_epoch() -> u32 {
++    RENDER_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+ }
+ 
+ /// PortMaster port: `RUFFLE_LAZY_SHAPES` (default on; "0" turns it off): DefineShape characters are
+diff --git a/core/src/library.rs b/core/src/library.rs
+index 74188cd5e..4f1d5b4c0 100644
+--- a/core/src/library.rs
++++ b/core/src/library.rs
+@@ -372,6 +372,31 @@ impl<'gc> MovieLibrary<'gc> {
+     }
+ }
+ 
++impl<'gc> Library<'gc> {
++    /// PortMaster port: frees the meshes of shapes not drawn since epoch `before`, then the
++    /// textures of library bitmaps no mesh uses any more. Returns (meshes, bitmaps) freed.
++    pub fn evict_unused_render_data(&self, before: u32) -> (usize, usize) {
++        let (mut meshes, mut bitmaps) = (0, 0);
++        for (_, library) in self.movie_libraries.0.iter() {
++            for character in library.characters.values() {
++                if let Character::Graphic(graphic) = character {
++                    meshes += graphic.evict_unused_meshes(before);
++                }
++            }
++        }
++        for (_, library) in self.movie_libraries.0.iter() {
++            for character in library.characters.values() {
++                if let Character::Bitmap(bitmap) = character
++                    && bitmap.evict_unused_handle()
++                {
++                    bitmaps += 1;
++                }
++            }
++        }
++        (meshes, bitmaps)
++    }
++}
++
+ pub struct MovieLibrarySource<'a, 'gc> {
+     pub library: &'a MovieLibrary<'gc>,
+ }
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 43ee6390d..d2b84b525 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2477,6 +2477,24 @@ impl Player {
+         PORT_FRAMESKIP.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+     }
+ 
++    /// PortMaster port: starts a new render epoch (a front end calls this every few seconds);
++    /// shapes drawn from now on note it.
++    pub fn advance_render_epoch(&mut self) -> u32 {
++        crate::display_object::advance_render_epoch()
++    }
++
++    /// PortMaster port: frees the meshes of shapes that have not been drawn in the last `epochs`
++    /// render epochs and the bitmap textures no mesh uses any more (both are made again on their
++    /// next draw). Returns (meshes, bitmaps) freed.
++    pub fn evict_unused_render_data(&mut self, epochs: u32) -> (usize, usize) {
++        let now = crate::display_object::advance_render_epoch();
++        let before = now.saturating_sub(epochs);
++        if before == 0 {
++            return (0, 0);
++        }
++        self.mutate_with_update_context(|context| context.library.evict_unused_render_data(before))
++    }
++
+     /// Runs the collector to the end of a cycle now (frees everything unreachable at once).
+     pub fn collect_garbage_now(&mut self) {
+         self.gc_arena.borrow_mut().finish_cycle();
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index de9c315aa..229e76c46 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -556,6 +556,17 @@ fn main() -> anyhow::Result<()> {
+     let mut pacer = port::Pacer::new(refresh_hz, pacing);
+     // What a malloc_trim took last time; it runs when the frame has that much time to spare
+     let mut trim_cost = Duration::from_millis(4);
++    // Low memory: every 5 s a new render epoch starts; when the system has less than
++    // RUFFLE_EVICT_MB (350, 0 = never) of memory available, the meshes of shapes not drawn in
++    // the last 4 epochs (15 to 20 s) and the bitmap textures no mesh uses any more are freed.
++    // They are made again when next drawn. Worlds 2 and 3 draw their level art into cache
++    // bitmaps when a level loads and never draw those shapes again, but kept their meshes and
++    // textures for every level visited.
++    let evict_below_mb: u64 = std::env::var("RUFFLE_EVICT_MB")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(350);
++    let mut last_epoch = Instant::now();
+ 
+     'main: loop {
+         // releases held back by the minimum key hold that are now due
+@@ -864,6 +875,33 @@ fn main() -> anyhow::Result<()> {
+                 );
+             }
+         }
++        // (not while paused: every shape would look unused after a long pause)
++        if paused.is_none() && last_epoch.elapsed() >= Duration::from_secs(5) {
++            last_epoch = Instant::now();
++            let mut player = player.lock().expect("player lock");
++            match mem_available_mb() {
++                Some(avail) if avail < evict_below_mb => {
++                    let start = Instant::now();
++                    let (meshes, bitmaps) = player.evict_unused_render_data(4);
++                    drop(player);
++                    if meshes + bitmaps > 0 {
++                        let rss0 = rss_mb();
++                        trim_heap();
++                        last_trim = Instant::now();
++                        tracing::info!(
++                            "low memory ({avail} MB available): freed {meshes} meshes and \
++                             {bitmaps} bitmap textures not drawn lately in {:?}, rss {rss0} -> {} MB",
++                            start.elapsed(),
++                            rss_mb()
++                        );
++                    }
++                }
++                _ => {
++                    player.advance_render_epoch();
++                }
++            }
++        }
++
+         // The heap trim runs where it does not delay a frame: in the time before the next frame
+         // is due (or while paused), else at the latest every 8 trim periods (the hub has no time
+         // to spare). Right after a load (a long tick) it runs at once, with a full collection.
+@@ -1081,6 +1119,14 @@ fn spawn_memlog() {
+     });
+ }
+ 
++/// MemAvailable from /proc/meminfo, in MB.
++fn mem_available_mb() -> Option<u64> {
++    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
++    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
++    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
++    Some(kb / 1024)
++}
++
+ fn rss_mb() -> u64 {
+     std::fs::read_to_string("/proc/self/statm")
+         .ok()
+-- 
+2.43.0
+

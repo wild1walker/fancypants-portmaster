@@ -12,6 +12,7 @@ The port runs the game's own SWF files in [Ruffle](https://ruffle.rs), a Flash P
 | Runtimes | none (bundled `ruffle_sdl`, Ruffle on the firmware's SDL2 and GLES 3) |
 | Tested game version | current Steam release (MD5 sums in [ports/fancypants/README.md](ports/fancypants/README.md)) |
 | Speed on an RG35XX H | Worlds 1 to 3: a steady 30 fps (their native rate). World 4 hub: about 16 fps, at the right game speed |
+| Hub pause | Start pauses the World 4 hub (a `ruffle_sdl` pause with an on-screen banner; Worlds 1 to 3 have their own) |
 
 ## For players
 
@@ -38,7 +39,7 @@ The Classic Pack is an Adobe AIR app: an ActionScript 3 shell (`ClassicPack.swf`
 * **The shell** (`patch/patch_shell.py`): Steamworks, AIR windowing and file APIs and GameInput are removed, settings and progress go to a local SharedObject, quitting uses `fscommand`, and switching worlds asks the launcher to restart Ruffle (one world in memory at a time). It also sets the frame rate and draws a backdrop for screens that are not 3:2.
 * **Worlds 1 to 3** (`patch/patch_world_as2.py`, applied to P-code): the camera can grow taller on 4:3 screens and small rooms stay centered. World 2 advances its clock by the real frame time and caches its levels at 1x instead of 1.5x resolution, so it keeps its speed at 30 fps and fits in 1 GB.
 * **World 4** (`patch/patch_world4.py`): textures load from PNG files instead of ATF, atlases are scaled to match, and Starling's texture uploads go through `BitmapData.draw`.
-* **Ruffle** (`build/ruffle-patches/`): an implementation of `Graphics.readGraphicsData` (World 4 builds its collision with it), Stage3D draw batching with pipeline and bind group caches, GPU side texture uploads, the relaunch command, an optional frame rate log, and for the AS2 worlds mouse picking only when the mouse moves plus frame skipping in World 3. Patch 0013 keeps short key taps (gptokeyb's Start) down for at least 100 ms, so the worlds see them. `ruffle_sdl` (patch 0006) is a small front end that runs Ruffle on the firmware's own SDL2 and GLES 3, so no Weston, X11 or Wayland runtime is needed. Patches 0007 to 0009 build each shape the first time it is drawn instead of when its SWF loads, and keep blank bitmaps out of memory, which roughly thirds the memory of a world (details in docs/PERFORMANCE.md).
+* **Ruffle** (`build/ruffle-patches/`): an implementation of `Graphics.readGraphicsData` (World 4 builds its collision with it), Stage3D draw batching with pipeline and bind group caches, GPU side texture uploads, the relaunch command, an optional frame rate log, and for the AS2 worlds mouse picking only when the mouse moves plus frame skipping in World 3. Patch 0013 keeps short key taps (gptokeyb's Start) down for at least 100 ms, so the worlds see them. Patch 0014 adds the hub pause (Start, once `FPAWorld4.swf` has loaded; the clock the hub runs on stops too), turns on World 3's frame skipping when it loads however the game was started, shows each frame on an even vsync cadence (a 30 fps world on a 60 Hz screen used to hold frames for one, two or three refreshes in turn), and moves the periodic `malloc_trim` into time a frame has to spare. Patch 0015 frees shape meshes and bitmap fill textures that have not been drawn for 15 to 20 s once the system runs low on memory (Worlds 2 and 3 kept those of every level visited). `ruffle_sdl` (patch 0006) is a small front end that runs Ruffle on the firmware's own SDL2 and GLES 3, so no Weston, X11 or Wayland runtime is needed. Patches 0007 to 0009 build each shape the first time it is drawn instead of when its SWF loads, and keep blank bitmaps out of memory, which roughly thirds the memory of a world (details in docs/PERFORMANCE.md).
 * **`fpa-prep`** (`tools/fpa-prep/`): a small Rust tool that decodes Adobe's ATF textures (JPEG XR endpoints plus LZMA compressed DXT indices) to PNG, scales World 4's atlas XML files and inflates SWFs on the device.
 
 The patch scripts work on source that JPEXS decompiles from your own SWF files at build time, so no game code is stored here. Measurements, what helped, and every approach that failed are in [docs/PORTING.md](docs/PORTING.md) and [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
@@ -84,7 +85,7 @@ The API calls, their pitfalls, frame rate logging, profiling and the PC runner a
 
 ## Known limitations
 
-* World 4 (the hub) is CPU bound at about 15 fps on a Cortex A53 at 1.5 GHz. It is timed by the clock, so it plays at the right speed. Moving GPU work to a second thread does not work with the Mali blob driver (see docs/PERFORMANCE.md).
+* World 4 (the hub) is CPU bound at about 15 fps on a Cortex A53 at 1.5 GHz (the launcher's performance governor adds about 1 fps). It is timed by the clock, so it plays at the right speed. Moving GPU work to a second thread does not work with the Mali blob driver (see docs/PERFORMANCE.md).
 * Entering a world door shows a short black screen while Ruffle restarts.
 * Steam achievements and Steam Cloud saves are not available; progress is saved locally.
 * Only the current Steam release is supported (the patcher checks MD5 sums).

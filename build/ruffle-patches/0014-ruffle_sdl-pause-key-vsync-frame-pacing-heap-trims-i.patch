@@ -1,0 +1,839 @@
+From 1a243cef9d07bcc700565454c8c9b069d3d388d4 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Tue, 13 Oct 2026 19:05:40 +0000
+Subject: [PATCH] ruffle_sdl: pause key, vsync frame pacing, heap trims in
+ spare time
+
+* Pause (--pause-key, --pause-with): a key that suspends the player (no
+  frames, timers or audio) and draws a banner over the last frame
+  ("PAUSED", Start to resume, Select+Start to quit) with scissored clears,
+  so no shader and no GL state wgpu relies on. With --pause-with the key
+  only becomes the pause key once the movie has loaded a file of that
+  name (the Fancy Pants hub, World4/FPAWorld4.swf, has no pause; the other
+  worlds have their own on the same key). Keys pressed or released while
+  paused are given to the movie on resume (the last event of each), so
+  none is left stuck down. Player::shift_start_time takes the pause out of
+  getTimer(), so a clock-timed game does not run the pause as one step.
+* --frameskip-with: turns on RUFFLE_FRAMESKIP (now also settable at run
+  time, Player::set_frameskip) once the movie loads a file of that name,
+  so World 3 gets it however it was started.
+* Frame pacing (RUFFLE_PACING=0 turns it off, RUFFLE_REFRESH_HZ sets the
+  refresh rate when SDL does not know it): a 30 fps movie on a 60 Hz
+  screen was shown one refresh after its tick when it drew in under a
+  refresh and two refreshes after when it took longer, so frames stayed
+  on screen for one, two or three refreshes in turn, and the clock
+  drifting against the screen moved frames between refreshes every few
+  seconds. A frame is now held until the refresh before its slot has
+  passed, the next tick runs right after the swap, and a tick's time step
+  within 15% of whole movie frames is rounded to them. Pacing turns itself
+  off when swaps do not wait for the refresh.
+* malloc_trim ran on the main thread every 2 s whatever the frame was
+  doing. It now runs in time the frame has to spare (before the frame's
+  slot, or before the next frame is due, or while paused), sized by what
+  the last trim took, and at the latest every 16 s.
+* Two malloc arenas (mallopt M_ARENA_MAX, unless MALLOC_ARENA_MAX is set).
+---
+ Cargo.lock         |   1 +
+ core/src/player.rs |  26 +++-
+ sdl/Cargo.toml     |   1 +
+ sdl/src/main.rs    | 256 +++++++++++++++++++++++++++++++---
+ sdl/src/port.rs    | 338 +++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 599 insertions(+), 23 deletions(-)
+ create mode 100644 sdl/src/port.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 44b31d93b..d52adffb6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5166,6 +5166,7 @@ name = "ruffle_sdl"
+ version = "0.7.0-nightly.2026.10.4"
+ dependencies = [
+  "anyhow",
++ "async-channel",
+  "clap",
+  "futures",
+  "glow",
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 4d10ce304..43ee6390d 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2463,6 +2463,20 @@ impl Player {
+         rval
+     }
+ 
++    /// PortMaster port: moves the movie's start time `d` later, so `getTimer()` (AVM1 and AVM2)
++    /// leaves out time the front end spent paused. Clock-timed games (the Fancy Pants hub) would
++    /// otherwise run the whole pause as one huge step when they resume.
++    pub fn shift_start_time(&mut self, d: Duration) {
++        let now = Instant::now();
++        self.start_time = (self.start_time + d).min(now);
++    }
++
++    /// PortMaster port: turns `RUFFLE_FRAMESKIP` on or off at run time (a front end that knows
++    /// which game is running).
++    pub fn set_frameskip(on: bool) {
++        PORT_FRAMESKIP.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
++    }
++
+     /// Runs the collector to the end of a cycle now (frees everything unreachable at once).
+     pub fn collect_garbage_now(&mut self) {
+         self.gc_arena.borrow_mut().finish_cycle();
+@@ -3370,10 +3384,20 @@ fn port_lazy_mouse_pick() -> bool {
+     })
+ }
+ 
++/// PortMaster port: frame skipping set at run time (`Player::set_frameskip`): 0 = not set,
++/// 1 = off, 2 = on.
++static PORT_FRAMESKIP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
+ /// PortMaster port: see `Player::max_frames_per_tick`.
+ fn port_frameskip() -> bool {
+     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var("RUFFLE_FRAMESKIP").is_ok_and(|v| !v.is_empty() && v != "0"))
++    match PORT_FRAMESKIP.load(std::sync::atomic::Ordering::Relaxed) {
++        1 => false,
++        2 => true,
++        _ => *ENABLED.get_or_init(|| {
++            std::env::var("RUFFLE_FRAMESKIP").is_ok_and(|v| !v.is_empty() && v != "0")
++        }),
++    }
+ }
+ 
+ #[cfg(not(target_family = "wasm"))]
+diff --git a/sdl/Cargo.toml b/sdl/Cargo.toml
+index 7d7f8982c..addc7968d 100644
+--- a/sdl/Cargo.toml
++++ b/sdl/Cargo.toml
+@@ -24,6 +24,7 @@ sdl2 = "0.37"
+ tracing = { workspace = true }
+ tracing-subscriber = { workspace = true }
+ anyhow = { workspace = true }
++async-channel = { workspace = true }
+ futures = { workspace = true }
+ url = { workspace = true }
+ 
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index 09539e004..de9c315aa 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -7,6 +7,7 @@
+ 
+ mod audio;
+ mod keys;
++mod port;
+ 
+ use anyhow::{Context as _, anyhow};
+ use clap::Parser;
+@@ -26,9 +27,10 @@ use ruffle_render_wgpu::backend::{WgpuRenderBackend, request_device};
+ use ruffle_render_wgpu::descriptors::Descriptors;
+ use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
+ use sdl2::event::{Event, WindowEvent};
++use sdl2::keyboard::Keycode;
+ use sdl2::mouse::MouseButton as SdlMouseButton;
+-use std::collections::HashMap;
+ use std::cell::Cell;
++use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::rc::Rc;
+ use std::sync::Arc;
+@@ -75,6 +77,20 @@ struct Opt {
+     /// letterbox bars; "movie" = the movie's own scale mode and alignment, no letterbox
+     #[clap(long, default_value = "fit", value_parser(["fit", "movie"]))]
+     stage_scale: String,
++
++    /// A key (SDL key name, e.g. "Space") that pauses and resumes the movie with an on-screen
++    /// banner. The key never reaches the movie.
++    #[clap(long)]
++    pause_key: Option<String>,
++
++    /// Only offer --pause-key once the movie has loaded a file with this name (for a game with
++    /// a pause of its own everywhere else); the key reaches the movie until then
++    #[clap(long)]
++    pause_with: Option<String>,
++
++    /// Turn on frame skipping (RUFFLE_FRAMESKIP) once the movie has loaded a file with this name
++    #[clap(long)]
++    frameskip_with: Option<String>,
+ }
+ 
+ fn parse_parameter(s: &str) -> Result<(String, String), String> {
+@@ -299,6 +315,18 @@ fn main() -> anyhow::Result<()> {
+         )
+         .init();
+     let opt = Opt::parse();
++    // Two malloc arenas instead of up to eight per core: each thread that allocates (audio, SDL)
++    // otherwise gets an arena of its own, whose freed memory glibc keeps (MALLOC_ARENA_MAX
++    // overrides).
++    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
++        unsafe { mallopt(M_ARENA_MAX, 2) };
++    }
++    let pause_key = match opt.pause_key.as_deref() {
++        Some(name) => {
++            Some(Keycode::from_name(name).ok_or_else(|| anyhow!("unknown --pause-key {name:?}"))?)
++        }
++        None => None,
++    };
+ 
+     let fit = opt.stage_scale == "fit";
+     let data = std::fs::read(&opt.swf).with_context(|| format!("reading {:?}", opt.swf))?;
+@@ -313,8 +341,11 @@ fn main() -> anyhow::Result<()> {
+         .parent()
+         .map(|p| p.to_path_buf())
+         .unwrap_or_default();
+-    let navigator = NullNavigatorBackend::with_base_path(&base_dir, &executor)
+-        .with_context(|| format!("SWF folder {base_dir:?}"))?;
++    let navigator = port::WatchingNavigator::new(
++        NullNavigatorBackend::with_base_path(&base_dir, &executor)
++            .with_context(|| format!("SWF folder {base_dir:?}"))?,
++    );
++    let fetched = navigator.fetched.clone();
+     drop(data);
+     movie.append_parameters(opt.parameters.clone());
+ 
+@@ -351,13 +382,29 @@ fn main() -> anyhow::Result<()> {
+     window
+         .gl_make_current(&gl_context)
+         .map_err(|e| anyhow!(e))?;
+-    let _ = video.gl_set_swap_interval(1);
++    let vsync = video.gl_set_swap_interval(1).is_ok();
++    // The screen's refresh rate, for frame pacing (RUFFLE_REFRESH_HZ overrides; 60 when SDL does
++    // not know it, as some handheld video drivers report 0). RUFFLE_PACING=0 turns pacing off.
++    let refresh_hz = std::env::var("RUFFLE_REFRESH_HZ")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or_else(|| {
++            window
++                .display_index()
++                .and_then(|i| video.current_display_mode(i))
++                .map(|m| m.refresh_rate)
++                .ok()
++                .filter(|hz| *hz > 0)
++                .unwrap_or(60)
++        });
++    let pacing = vsync && std::env::var("RUFFLE_PACING").map_or(true, |v| v != "0");
+     sdl.mouse().show_cursor(false);
+     let (width, height) = window.drawable_size();
+     let screen = Rc::new(Cell::new((width, height)));
+ 
+     let loader = |name: &str| video.gl_get_proc_address(name) as *const std::ffi::c_void;
+     let gl = Rc::new(unsafe { glow::Context::from_loader_function(loader) });
++    let banner_gl = gl.clone();
+     tracing::info!(
+         "GL: {} / {}",
+         unsafe { gl.get_parameter_string(glow::RENDERER) },
+@@ -497,6 +544,19 @@ fn main() -> anyhow::Result<()> {
+     let mut key_down_at: HashMap<String, Instant> = HashMap::new();
+     let mut held_ups: Vec<(Instant, String, PlayerEvent)> = Vec::new();
+ 
++    // Front end pause (--pause-key): the player is suspended (no frames, timers or audio) and a
++    // banner is drawn over the last frame. Keys pressed or released meanwhile are kept (the last
++    // event of each key) and given to the movie on resume, so no key is left stuck down.
++    let mut pause_allowed = pause_key.is_some() && opt.pause_with.is_none();
++    let mut paused: Option<Instant> = None;
++    let mut paused_keys: Vec<(String, PlayerEvent)> = Vec::new();
++    let mut toggle_pause = false;
++    let mut force_render = false;
++    let mut fetched_seen = 0;
++    let mut pacer = port::Pacer::new(refresh_hz, pacing);
++    // What a malloc_trim took last time; it runs when the frame has that much time to spare
++    let mut trim_cost = Duration::from_millis(4);
++
+     'main: loop {
+         // releases held back by the minimum key hold that are now due
+         if !held_ups.is_empty() {
+@@ -511,7 +571,15 @@ fn main() -> anyhow::Result<()> {
+                 }
+             });
+         }
+-        let mut wait = next_frame.saturating_duration_since(Instant::now());
++        let mut wait = if paused.is_some() {
++            Duration::from_millis(100)
++        } else {
++            next_frame.saturating_duration_since(Instant::now())
++        };
++        // right after a frame was shown, run a tick that is due within half a refresh now
++        if pacer.early_tick().is_some_and(|early| wait <= early) {
++            wait = Duration::ZERO;
++        }
+         if let Some((due, _, _)) = held_ups.iter().min_by_key(|(due, _, _)| *due) {
+             wait = wait.min(due.saturating_duration_since(Instant::now()));
+         }
+@@ -524,6 +592,55 @@ fn main() -> anyhow::Result<()> {
+             .into_iter()
+             .chain(std::iter::from_fn(|| events.poll_event()))
+         {
++            if let (Some(key), true) = (pause_key, pause_allowed) {
++                match &event {
++                    Event::KeyDown {
++                        keycode: Some(k),
++                        repeat,
++                        ..
++                    } if *k == key => {
++                        toggle_pause |= !*repeat;
++                        continue;
++                    }
++                    Event::KeyUp {
++                        keycode: Some(k), ..
++                    } if *k == key => continue,
++                    _ => {}
++                }
++            }
++            if paused.is_some() {
++                let kept = match &event {
++                    Event::KeyDown {
++                        scancode,
++                        keycode,
++                        keymod,
++                        ..
++                    } => Some((
++                        format!("{scancode:?}{keycode:?}"),
++                        PlayerEvent::KeyDown {
++                            key: keys::key_descriptor(*scancode, *keycode, *keymod),
++                        },
++                    )),
++                    Event::KeyUp {
++                        scancode,
++                        keycode,
++                        keymod,
++                        ..
++                    } => Some((
++                        format!("{scancode:?}{keycode:?}"),
++                        PlayerEvent::KeyUp {
++                            key: keys::key_descriptor(*scancode, *keycode, *keymod),
++                        },
++                    )),
++                    Event::TextInput { .. } => continue,
++                    _ => None,
++                };
++                if let Some((id, key_event)) = kept {
++                    paused_keys.retain(|(kept, _)| *kept != id);
++                    paused_keys.push((id, key_event));
++                    continue;
++                }
++            }
+             let player_event = match event {
+                 Event::Quit { .. } => break 'main,
+                 Event::KeyDown {
+@@ -619,17 +736,76 @@ fn main() -> anyhow::Result<()> {
+             break;
+         }
+ 
++        if std::mem::take(&mut toggle_pause) {
++            let mut player = player.lock().expect("player lock");
++            match paused.take() {
++                None => {
++                    // suspending also pauses the audio output
++                    player.set_is_playing(false);
++                    paused = Some(Instant::now());
++                    player.render();
++                    drop(player);
++                    let (sw, sh) = screen.get();
++                    port::draw_pause_banner(&banner_gl, sw, sh);
++                    window.gl_swap_window();
++                    tracing::info!("paused");
++                }
++                Some(since) => {
++                    let paused_for = since.elapsed();
++                    // getTimer() leaves the pause out, so clock-timed games do not jump ahead
++                    player.shift_start_time(paused_for);
++                    player.set_is_playing(true);
++                    for (_, key_event) in paused_keys.drain(..) {
++                        player.handle_event(key_event);
++                    }
++                    time = Instant::now();
++                    next_frame = time;
++                    force_render = true;
++                    tracing::info!("resumed after {:.1} s", paused_for.as_secs_f64());
++                }
++            }
++            pacer.reset();
++        }
++
+         // file loads started by the movie (Loader, URLLoader, loadMovie)
+         executor.run();
+ 
++        // the movie loaded a file that turns on the pause key or frame skipping
++        if fetched.borrow().len() > fetched_seen {
++            for name in &fetched.borrow()[fetched_seen..] {
++                if opt
++                    .pause_with
++                    .as_ref()
++                    .is_some_and(|w| name.eq_ignore_ascii_case(w))
++                    && pause_key.is_some()
++                    && !pause_allowed
++                {
++                    tracing::info!("{name} loaded: the pause key is on");
++                    pause_allowed = true;
++                }
++                if opt
++                    .frameskip_with
++                    .as_ref()
++                    .is_some_and(|w| name.eq_ignore_ascii_case(w))
++                {
++                    tracing::info!("{name} loaded: frame skipping on");
++                    ruffle_core::Player::set_frameskip(true);
++                }
++            }
++            fetched_seen = fetched.borrow().len();
++        }
++
+         let now = Instant::now();
+-        let dt = FloatDuration::from_std(now.duration_since(time));
+-        if dt.as_millis() > 0.0 {
++        let raw_dt = now.duration_since(time);
++        if paused.is_none() && !raw_dt.is_zero() {
+             time = now;
++            pacer.just_presented = false;
+             let mut player = player.lock().expect("player lock");
+             if gc_step > 0.0 {
+                 player.add_gc_work(gc_step);
+             }
++            let frame_rate = player.frame_rate();
++            let dt = FloatDuration::from_std(pacer.snap(raw_dt, frame_rate));
+             let t0 = Instant::now();
+             player.tick(dt);
+             let t1 = Instant::now();
+@@ -645,13 +821,28 @@ fn main() -> anyhow::Result<()> {
+             }
+             next_frame = now + player.time_til_next_frame();
+             timing.0 += t1 - t0;
+-            if player.needs_render() {
++            if player.needs_render() || std::mem::take(&mut force_render) {
+                 player.render();
+                 drop(player);
+                 let t2 = Instant::now();
++                // a heap trim fits in the time this frame waits for its slot
++                if !collect_now
++                    && !trim_every.is_zero()
++                    && last_trim.elapsed() >= trim_every
++                    && pacer
++                        .slack(frame_rate)
++                        .is_some_and(|slack| slack >= trim_cost * 2)
++                {
++                    trim_cost = trim_heap();
++                    last_trim = Instant::now();
++                }
++                pacer.before_swap(frame_rate);
++                let t3 = Instant::now();
+                 window.gl_swap_window();
++                let swap_time = t3.elapsed();
++                pacer.after_swap(swap_time);
+                 timing.1 += t2 - t1;
+-                timing.2 += t2.elapsed();
++                timing.2 += swap_time;
+                 timing.3 += 1;
+             }
+             if timing_log && timing.4.elapsed() >= Duration::from_secs(2) {
+@@ -673,22 +864,30 @@ fn main() -> anyhow::Result<()> {
+                 );
+             }
+         }
+-        if collect_now || (!trim_every.is_zero() && last_trim.elapsed() >= trim_every) {
+-            let (start, rss0) = (Instant::now(), rss_mb());
++        // The heap trim runs where it does not delay a frame: in the time before the next frame
++        // is due (or while paused), else at the latest every 8 trim periods (the hub has no time
++        // to spare). Right after a load (a long tick) it runs at once, with a full collection.
++        let spare = if paused.is_some() {
++            Duration::MAX
++        } else {
++            next_frame.saturating_duration_since(Instant::now())
++        };
++        let trim_due = !trim_every.is_zero() && last_trim.elapsed() >= trim_every;
++        if collect_now
++            || trim_due && (spare >= trim_cost * 2 || last_trim.elapsed() >= trim_every * 8)
++        {
+             if collect_now {
++                let (start, rss0) = (Instant::now(), rss_mb());
+                 player.lock().expect("player lock").collect_garbage_now();
++                unsafe { malloc_trim(0) };
++                tracing::debug!(
++                    "full collection and trim after a long tick: rss {rss0} -> {} MB in {:?}",
++                    rss_mb(),
++                    start.elapsed()
++                );
++            } else {
++                trim_cost = trim_heap();
+             }
+-            unsafe { malloc_trim(0) };
+-            tracing::debug!(
+-                "trim{}: rss {rss0} -> {} MB in {:?}",
+-                if collect_now {
+-                    " (full collection after a long tick)"
+-                } else {
+-                    ""
+-                },
+-                rss_mb(),
+-                start.elapsed()
+-            );
+             collect_now = false;
+             last_trim = Instant::now();
+         }
+@@ -710,8 +909,21 @@ fn mouse_button(button: SdlMouseButton) -> MouseButton {
+     }
+ }
+ 
++/// Returns freed heap memory to the system; returns how long that took (at least 1 ms, the
++/// estimate for the next trim).
++fn trim_heap() -> Duration {
++    let (start, rss0) = (Instant::now(), rss_mb());
++    unsafe { malloc_trim(0) };
++    let took = start.elapsed();
++    tracing::debug!("trim: rss {rss0} -> {} MB in {took:?}", rss_mb());
++    took.max(Duration::from_millis(1))
++}
++
++const M_ARENA_MAX: i32 = -8;
++
+ unsafe extern "C" {
+     fn malloc_trim(pad: usize) -> i32;
++    fn mallopt(param: i32, value: i32) -> i32;
+     fn mallinfo() -> MallInfo;
+     fn dlsym(
+         handle: *mut std::ffi::c_void,
+diff --git a/sdl/src/port.rs b/sdl/src/port.rs
+new file mode 100644
+index 000000000..2c20354c7
+--- /dev/null
++++ b/sdl/src/port.rs
+@@ -0,0 +1,338 @@
++//! PortMaster port helpers for the main loop: a front end pause with an on-screen banner (for
++//! movies that have no pause of their own, like the Fancy Pants Adventures hub), a navigator that
++//! notes which files the movie loads (so a mode can follow the world that is running), and frame
++//! pacing that presents each frame on an even vsync cadence.
++
++use async_channel::{Receiver, Sender};
++use glow::HasContext;
++use ruffle_core::backend::navigator::{
++    ErrorResponse, NavigationMethod, NavigatorBackend, NullNavigatorBackend, OwnedFuture,
++    SuccessResponse,
++};
++use ruffle_core::indexmap::IndexMap;
++use ruffle_core::loader::Error;
++use ruffle_core::socket::{SocketAction, SocketHandle};
++use std::cell::RefCell;
++use std::rc::Rc;
++use std::time::{Duration, Instant};
++use url::{ParseError, Url};
++
++/// `NullNavigatorBackend` that records the file name of every fetch, so the main loop can tell
++/// which world the movie has loaded.
++pub struct WatchingNavigator {
++    inner: NullNavigatorBackend,
++    pub fetched: Rc<RefCell<Vec<String>>>,
++}
++
++impl WatchingNavigator {
++    pub fn new(inner: NullNavigatorBackend) -> Self {
++        Self {
++            inner,
++            fetched: Rc::new(RefCell::new(Vec::new())),
++        }
++    }
++}
++
++impl NavigatorBackend for WatchingNavigator {
++    fn navigate_to_url(
++        &self,
++        url: &str,
++        target: &str,
++        vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
++    ) {
++        self.inner.navigate_to_url(url, target, vars_method)
++    }
++
++    fn fetch(
++        &self,
++        request: ruffle_core::backend::navigator::Request,
++    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
++        let name = request
++            .url()
++            .rsplit(['/', '\\'])
++            .next()
++            .unwrap_or_default()
++            .split(['?', '#'])
++            .next()
++            .unwrap_or_default()
++            .to_string();
++        self.fetched.borrow_mut().push(name);
++        self.inner.fetch(request)
++    }
++
++    fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
++        self.inner.resolve_url(url)
++    }
++
++    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
++        self.inner.spawn_future(future)
++    }
++
++    fn pre_process_url(&self, url: Url) -> Url {
++        self.inner.pre_process_url(url)
++    }
++
++    fn connect_socket(
++        &mut self,
++        host: String,
++        port: u16,
++        timeout: Duration,
++        handle: SocketHandle,
++        receiver: Receiver<Vec<u8>>,
++        sender: Sender<SocketAction>,
++    ) {
++        self.inner
++            .connect_socket(host, port, timeout, handle, receiver, sender)
++    }
++}
++
++/// 5x7 pixel glyphs for the pause banner (one byte per row, the low 5 bits, left to right).
++fn glyph(c: char) -> [u8; 7] {
++    match c {
++        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
++        'C' => [0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e],
++        'D' => [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
++        'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
++        'I' => [0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e],
++        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
++        'M' => [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11],
++        'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
++        'Q' => [0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d],
++        'R' => [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
++        'S' => [0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e],
++        'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
++        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
++        '+' => [0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00],
++        ':' => [0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00],
++        _ => [0; 7],
++    }
++}
++
++/// Width in pixels of `text` drawn at `scale` (6 columns per character, the last one blank).
++fn text_width(text: &str, scale: i32) -> i32 {
++    (text.chars().count() as i32 * 6 - 1) * scale
++}
++
++/// Fills a rectangle given in top-left screen coordinates (GL scissor counts from the bottom).
++unsafe fn fill(gl: &glow::Context, sh: i32, x: i32, y: i32, w: i32, h: i32, rgb: f32) {
++    unsafe {
++        gl.scissor(x, sh - y - h, w, h);
++        gl.clear_color(rgb, rgb, rgb, 1.0);
++        gl.clear(glow::COLOR_BUFFER_BIT);
++    }
++}
++
++unsafe fn draw_text(gl: &glow::Context, sh: i32, text: &str, x: i32, y: i32, scale: i32) {
++    for (i, c) in text.chars().enumerate() {
++        let cx = x + i as i32 * 6 * scale;
++        for (row, bits) in glyph(c).iter().enumerate() {
++            // one rectangle per horizontal run of lit pixels
++            let mut col = 0;
++            while col < 5 {
++                if bits & (0x10 >> col) == 0 {
++                    col += 1;
++                    continue;
++                }
++                let start = col;
++                while col < 5 && bits & (0x10 >> col) != 0 {
++                    col += 1;
++                }
++                unsafe {
++                    fill(
++                        gl,
++                        sh,
++                        cx + start * scale,
++                        y + row as i32 * scale,
++                        (col - start) * scale,
++                        scale,
++                        1.0,
++                    )
++                };
++            }
++        }
++    }
++}
++
++/// Draws the pause banner over whatever is in the window's back buffer: a black band across the
++/// middle of the screen with "PAUSED" and the buttons to resume or quit. Only uses scissored
++/// clears, so it needs no shader and leaves no GL state behind that wgpu relies on.
++pub fn draw_pause_banner(gl: &glow::Context, sw: u32, sh: u32) {
++    const TITLE: &str = "PAUSED";
++    const HINT: &str = "START: RESUME   SELECT+START: QUIT";
++    let (sw, sh) = (sw as i32, sh as i32);
++    let big = (sh / 80).max(2);
++    let mut small = (sh / 240).max(1);
++    while small > 1 && text_width(HINT, small) > sw - 8 {
++        small -= 1;
++    }
++    let pad = big * 3;
++    let band_h = pad + 7 * big + pad + 7 * small + pad;
++    let band_y = (sh - band_h) / 2;
++    unsafe {
++        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
++        gl.viewport(0, 0, sw, sh);
++        gl.color_mask(true, true, true, true);
++        gl.enable(glow::SCISSOR_TEST);
++        fill(gl, sh, 0, band_y, sw, band_h, 0.0);
++        draw_text(
++            gl,
++            sh,
++            TITLE,
++            (sw - text_width(TITLE, big)) / 2,
++            band_y + pad,
++            big,
++        );
++        draw_text(
++            gl,
++            sh,
++            HINT,
++            (sw - text_width(HINT, small)) / 2,
++            band_y + pad + 7 * big + pad,
++            small,
++        );
++        gl.disable(glow::SCISSOR_TEST);
++    }
++}
++
++/// Presents frames on an even vsync cadence.
++///
++/// With a blocking swap (vsync) a 30 fps movie on a 60 Hz screen should be shown every second
++/// refresh. Ruffle's frames are timed by the clock, though, and a swap shows the frame at the
++/// first refresh after the frame is done: a frame that took 14 ms appeared one refresh after its
++/// tick, one that took 19 ms two refreshes after it, so frames were held on screen for one, two or
++/// three refreshes in turn (judder), and the clock drifting against the screen's real rate moved
++/// frames across refreshes every few seconds. The pacer
++/// * holds a frame back until the refresh before its slot has passed, so it is shown exactly
++///   `per_frame` refreshes after the previous one, however long it took to draw (up to the slot),
++/// * lets the next tick run right after the swap instead of waiting for the clock, and
++/// * rounds the tick's time step to whole movie frames when it is within 15% of one, so a frame
++///   runs on every slot instead of being put off by a fraction of a millisecond.
++///
++/// It stays off when the screen's refresh rate is unknown, and turns itself off when swaps turn
++/// out not to wait for the refresh (no vsync, or a driver that queues frames).
++pub struct Pacer {
++    period: Option<Duration>,
++    /// When the last swap that waited for the refresh returned (a refresh)
++    last_present: Option<Instant>,
++    /// The last swap returned at a refresh, so the next tick can run right away
++    pub just_presented: bool,
++    swaps: u32,
++    waited: u32,
++}
++
++impl Pacer {
++    pub fn new(refresh_hz: i32, enabled: bool) -> Self {
++        let period = (enabled && (20..=250).contains(&refresh_hz))
++            .then(|| Duration::from_secs_f64(1.0 / refresh_hz as f64));
++        if let Some(period) = period {
++            tracing::info!("frame pacing on a {refresh_hz} Hz screen ({period:?} per refresh)");
++        }
++        Self {
++            period,
++            last_present: None,
++            just_presented: false,
++            swaps: 0,
++            waited: 0,
++        }
++    }
++
++    /// Refreshes per movie frame, when the movie's rate divides the screen's (60 Hz and 30 fps:
++    /// 2), else 1.
++    fn per_frame(&self, frame_rate: f64) -> u32 {
++        let Some(period) = self.period else {
++            return 1;
++        };
++        if frame_rate <= 0.0 || !frame_rate.is_finite() {
++            return 1;
++        }
++        let ratio = 1.0 / (period.as_secs_f64() * frame_rate);
++        let n = ratio.round();
++        if n >= 2.0 && (ratio - n).abs() < 0.1 {
++            n as u32
++        } else {
++            1
++        }
++    }
++
++    /// The time step for the next tick: within 15% of a whole number of movie frames, exactly
++    /// that number of frames.
++    pub fn snap(&self, dt: Duration, frame_rate: f64) -> Duration {
++        // only once swaps have been seen to wait for the refresh
++        if self.period.is_none() || self.waited < 10 || frame_rate <= 0.0 || !frame_rate.is_finite()
++        {
++            return dt;
++        }
++        let frame = 1.0 / frame_rate;
++        let frames = (dt.as_secs_f64() / frame).round();
++        if frames >= 1.0 && (dt.as_secs_f64() - frames * frame).abs() <= 0.15 * frame {
++            // a hair over, so the accumulator never ends a whisker short of a frame
++            Duration::from_secs_f64(frames * frame + 1e-6)
++        } else {
++            dt
++        }
++    }
++
++    /// How long the main thread can spend on other work (a heap trim) before it has to swap to
++    /// make this frame's slot, or `None` without pacing.
++    pub fn slack(&self, frame_rate: f64) -> Option<Duration> {
++        let (period, last) = (self.period?, self.last_present?);
++        let deadline = last + period * self.per_frame(frame_rate);
++        Some(deadline.saturating_duration_since(Instant::now() + Duration::from_micros(1500)))
++    }
++
++    /// Call right before the swap: waits until the refresh before this frame's slot has passed.
++    pub fn before_swap(&self, frame_rate: f64) {
++        let (Some(period), Some(last)) = (self.period, self.last_present) else {
++            return;
++        };
++        let n = self.per_frame(frame_rate);
++        if n < 2 {
++            return;
++        }
++        let earliest = last + period * (n - 1) + Duration::from_micros(1500);
++        let now = Instant::now();
++        // only for the frame right after the last present (not after a pause or a load)
++        if now < earliest && earliest - now < period * n {
++            std::thread::sleep(earliest - now);
++        }
++    }
++
++    /// Call right after the swap with how long the swap took.
++    pub fn after_swap(&mut self, swap_time: Duration) {
++        let Some(period) = self.period else {
++            return;
++        };
++        self.swaps += 1;
++        if swap_time >= period / 4 {
++            self.waited += 1;
++            self.last_present = Some(Instant::now());
++            self.just_presented = true;
++        } else {
++            self.just_presented = false;
++        }
++        // check once, early: do swaps wait for the refresh at all?
++        if self.swaps == 120 {
++            if self.waited < 30 {
++                tracing::info!(
++                    "frame pacing off: only {} of {} swaps waited for a refresh",
++                    self.waited,
++                    self.swaps
++                );
++                self.period = None;
++                self.last_present = None;
++                self.just_presented = false;
++            }
++        }
++    }
++
++    /// Forget the last present (after a pause or anything else that stopped the frames).
++    pub fn reset(&mut self) {
++        self.last_present = None;
++        self.just_presented = false;
++    }
++
++    /// Waits shorter than this after a present are skipped (the frame is due at this refresh).
++    pub fn early_tick(&self) -> Option<Duration> {
++        self.period.filter(|_| self.just_presented).map(|p| p / 2)
++    }
++}
+-- 
+2.43.0
+
